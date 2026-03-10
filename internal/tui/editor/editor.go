@@ -1,6 +1,7 @@
 package editor
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
@@ -24,6 +25,8 @@ const (
 	ModeNormal                 // Vim navigation; textarea still visible + focused (cursor shown)
 	ModePreview                // Glamour read-only viewport (toggle with Ctrl+P)
 )
+
+const maxUndoStack = 100
 
 // snapshot captures content and cursor position for undo/redo.
 type snapshot struct {
@@ -53,6 +56,17 @@ type Model struct {
 	pendingOp      byte // 'd', 'y', 'c', '>', '<', or 0
 	pendingG       bool // first 'g' of 'gg'
 	pendingReplace bool // 'r' waiting for replacement char
+	pendingFind    bool // 'f'/'F' waiting for target char
+	findForward    bool // direction of last f/F find
+	findChar       rune // char of last f/F find (0 = none)
+	pendingInner   bool // 'i' in ciw/diw/yiw
+
+	// / search
+	searching        bool
+	searchQuery      string
+	searchMatches    []vim.Position
+	searchMatchIdx   int
+	preFindCursorPos vim.Position // cursor pos before search started
 
 	// Count prefix accumulator ("2" in "2j", "12" in "12w")
 	countStr string
@@ -77,7 +91,7 @@ func New() Model {
 	return Model{
 		textarea: ta,
 		viewport: viewport.New(0, 0),
-		mode:     ModeInsert,
+		mode:     ModeNormal,
 	}
 }
 
@@ -109,9 +123,17 @@ func (m *Model) SetSize(w, h int) {
 func (m *Model) SetActive(active bool) {
 	m.active = active
 	if active {
+		if m.mode == ModePreview {
+			m.mode = ModeNormal
+		}
 		m.textarea.Focus()
 	} else {
 		m.textarea.Blur()
+		if m.mode != ModePreview {
+			m.updateViewport()
+			m.prevMode = m.mode
+			m.mode = ModePreview
+		}
 	}
 }
 
@@ -140,6 +162,8 @@ func (m *Model) EnterInsert() {
 	m.pendingOp = 0
 	m.pendingG = false
 	m.pendingReplace = false
+	m.pendingFind = false
+	m.pendingInner = false
 	m.countStr = ""
 }
 
@@ -154,6 +178,9 @@ func (m Model) Note() *models.Note { return m.note }
 func (m *Model) enterNormal() {
 	// Push undo if content changed during the Insert session.
 	if m.textarea.Value() != m.insertStartContent {
+		if len(m.undoStack) >= maxUndoStack {
+			m.undoStack = m.undoStack[1:]
+		}
 		m.undoStack = append(m.undoStack, snapshot{
 			content: m.insertStartContent,
 			line:    m.insertStartLine,
@@ -165,6 +192,8 @@ func (m *Model) enterNormal() {
 	m.pendingOp = 0
 	m.pendingG = false
 	m.pendingReplace = false
+	m.pendingFind = false
+	m.pendingInner = false
 	m.countStr = ""
 }
 
@@ -179,11 +208,38 @@ func (m *Model) enterInsert() {
 	m.pendingOp = 0
 	m.pendingG = false
 	m.pendingReplace = false
+	m.pendingFind = false
+	m.pendingInner = false
 	m.countStr = ""
+}
+
+// todoLinePrefixes are the markers that start a todo line.
+var todoLinePrefixes = []string{"[] ", "[x] ", "[1] ", "[2] ", "[3] ", "[4] "}
+
+func isTodoLine(trimmed string) bool {
+	for _, p := range todoLinePrefixes {
+		if strings.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) updateViewport() {
 	content := m.textarea.Value()
+	// Glamour collapses consecutive lines into one paragraph. Insert a blank
+	// line after each todo line so they render on separate lines.
+	lines := strings.Split(content, "\n")
+	processed := make([]string, 0, len(lines))
+	for i, line := range lines {
+		processed = append(processed, line)
+		if isTodoLine(strings.TrimLeft(line, " \t")) {
+			if i+1 >= len(lines) || strings.TrimSpace(lines[i+1]) != "" {
+				processed = append(processed, "")
+			}
+		}
+	}
+	content = strings.Join(processed, "\n")
 	// Ensure content ends with newline so glamour closes the last block.
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
@@ -210,6 +266,9 @@ func (m *Model) updateViewport() {
 // ── Undo / redo ───────────────────────────────────────────────────────────────
 
 func (m *Model) pushUndo() {
+	if len(m.undoStack) >= maxUndoStack {
+		m.undoStack = m.undoStack[1:]
+	}
 	m.undoStack = append(m.undoStack, snapshot{
 		content: m.textarea.Value(),
 		line:    m.textarea.Line(),
@@ -224,6 +283,8 @@ func (m *Model) resetPending() {
 	m.pendingOp = 0
 	m.pendingG = false
 	m.pendingReplace = false
+	m.pendingFind = false
+	m.pendingInner = false
 	m.countStr = ""
 }
 
@@ -379,6 +440,116 @@ func clampInt(v, lo, hi int) int {
 	return v
 }
 
+// ── Find-char helpers ─────────────────────────────────────────────────────────
+
+func isEditorWordChar(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+// doFind scans the current line for findChar and moves cursor (or applies op).
+func (m *Model) doFind(forward bool) {
+	content := m.textarea.Value()
+	lines := vim.Lines(content)
+	line := m.textarea.Line()
+	col := m.textarea.LineInfo().CharOffset
+	if line >= len(lines) {
+		return
+	}
+	lr := []rune(lines[line])
+	targetCol := -1
+	if forward {
+		for i := col + 1; i < len(lr); i++ {
+			if lr[i] == m.findChar {
+				targetCol = i
+				break
+			}
+		}
+	} else {
+		for i := col - 1; i >= 0; i-- {
+			if lr[i] == m.findChar {
+				targetCol = i
+				break
+			}
+		}
+	}
+	if targetCol < 0 {
+		return
+	}
+	targetPos := vim.Position{Line: line, Col: targetCol}
+	if m.pendingOp != 0 {
+		m.pushUndo()
+		if forward {
+			m.applyOpForward(targetPos, true) // inclusive like vim f
+		} else {
+			m.applyOpBackward(targetPos)
+		}
+	} else {
+		m.textarea = navigateTo(m.textarea, targetPos)
+	}
+}
+
+// ── Search helpers ────────────────────────────────────────────────────────────
+
+func (m *Model) updateSearchMatches() {
+	m.searchMatches = computeSearchMatches(m.textarea.Value(), m.searchQuery)
+	if len(m.searchMatches) > 0 {
+		m.searchMatchIdx = 0
+		m.textarea = navigateTo(m.textarea, m.searchMatches[0])
+	}
+}
+
+func computeSearchMatches(content, query string) []vim.Position {
+	if query == "" {
+		return nil
+	}
+	queryRunes := []rune(query)
+	qLen := len(queryRunes)
+	var matches []vim.Position
+	for lineIdx, line := range strings.Split(content, "\n") {
+		lineRunes := []rune(line)
+		for i := 0; i <= len(lineRunes)-qLen; i++ {
+			match := true
+			for j := 0; j < qLen; j++ {
+				if lineRunes[i+j] != queryRunes[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				matches = append(matches, vim.Position{Line: lineIdx, Col: i})
+			}
+		}
+	}
+	return matches
+}
+
+// ── Inner-word helper ─────────────────────────────────────────────────────────
+
+// innerWordRange returns byte offsets [from, to) of the word under the cursor.
+func innerWordRange(_ string, lines []string, pos vim.Position) (int, int) {
+	if pos.Line >= len(lines) {
+		return 0, 0
+	}
+	lr := []rune(lines[pos.Line])
+	col := pos.Col
+	if len(lr) == 0 || col >= len(lr) {
+		return 0, 0
+	}
+	if !isEditorWordChar(lr[col]) {
+		return 0, 0
+	}
+	start := col
+	for start > 0 && isEditorWordChar(lr[start-1]) {
+		start--
+	}
+	end := col + 1
+	for end < len(lr) && isEditorWordChar(lr[end]) {
+		end++
+	}
+	lineStart := vim.ToOffset(lines, vim.Position{Line: pos.Line, Col: 0})
+	return lineStart + start, lineStart + end
+}
+
 // Update handles keyboard events.
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -424,6 +595,35 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			key := keyMsg.String()
 
+			// ── Search input mode (while typing query) ────────────────────
+			if m.searching {
+				switch key {
+				case "enter":
+					m.searching = false
+					return m, nil
+				case "esc":
+					m.searching = false
+					m.searchQuery = ""
+					m.searchMatches = nil
+					m.textarea = navigateTo(m.textarea, m.preFindCursorPos)
+					return m, nil
+				case "backspace", "ctrl+h":
+					if len(m.searchQuery) > 0 {
+						runes := []rune(m.searchQuery)
+						m.searchQuery = string(runes[:len(runes)-1])
+						m.updateSearchMatches()
+					}
+					return m, nil
+				default:
+					runes := []rune(key)
+					if len(runes) == 1 {
+						m.searchQuery += string(runes)
+						m.updateSearchMatches()
+					}
+					return m, nil
+				}
+			}
+
 			// ── r<char>: replace char at cursor ──────────────────────────
 			if m.pendingReplace {
 				m.pendingReplace = false
@@ -445,6 +645,17 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 						}
 					}
 				}
+				return m, nil
+			}
+
+			// ── f/F pending: capture char to find ────────────────────────
+			if m.pendingFind {
+				runes := []rune(key)
+				if len(runes) == 1 {
+					m.findChar = runes[0]
+					m.doFind(m.findForward)
+				}
+				m.resetPending()
 				return m, nil
 			}
 
@@ -473,6 +684,10 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 			// ── Enter insert mode ─────────────────────────────────────────
 			case "i":
+				if m.pendingOp != 0 {
+					m.pendingInner = true
+					return m, nil
+				}
 				m.enterInsert()
 				return m, nil
 
@@ -748,6 +963,28 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 			// ── Word motions: w b e W B E (with count and operator) ───────
 			case "w":
+				if m.pendingInner && m.pendingOp != 0 {
+					// ciw / diw / yiw
+					lines := vim.Lines(m.textarea.Value())
+					from, to := innerWordRange(m.textarea.Value(), lines, curPos(m.textarea))
+					if from < to {
+						m.pushUndo()
+						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+						if m.pendingOp == 'd' || m.pendingOp == 'c' {
+							m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
+							newLines := vim.Lines(m.textarea.Value())
+							startPos := vim.FromOffset(newLines, from)
+							m.textarea = navigateTo(m.textarea, startPos)
+							if m.pendingOp == 'c' {
+								m.resetPending()
+								m.enterInsert()
+								return m, nil
+							}
+						}
+					}
+					m.resetPending()
+					return m, nil
+				}
 				count := m.parseCount()
 				lines := vim.Lines(m.textarea.Value())
 				np := curPos(m.textarea)
@@ -847,6 +1084,33 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					m.textarea = navigateTo(m.textarea, np)
 					m.resetPending()
 				}
+				return m, nil
+
+			// ── f/F: find char on line ────────────────────────────────────
+			case "f":
+				m.pendingFind = true
+				m.findForward = true
+				m.pendingG = false
+				return m, nil
+
+			case "F":
+				m.pendingFind = true
+				m.findForward = false
+				m.pendingG = false
+				return m, nil
+
+			case ";":
+				if m.findChar != 0 {
+					m.doFind(m.findForward)
+				}
+				m.resetPending()
+				return m, nil
+
+			case ",":
+				if m.findChar != 0 {
+					m.doFind(!m.findForward)
+				}
+				m.resetPending()
 				return m, nil
 
 			// ── x: delete count chars forward ─────────────────────────────
@@ -1160,6 +1424,31 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				m.resetPending()
 				return m, nil
 
+			// ── /: start search ───────────────────────────────────────────
+			case "/":
+				m.searching = true
+				m.searchQuery = ""
+				m.preFindCursorPos = curPos(m.textarea)
+				m.resetPending()
+				return m, nil
+
+			// ── n/N: next/prev search match ───────────────────────────────
+			case "n":
+				if len(m.searchMatches) > 0 {
+					m.searchMatchIdx = (m.searchMatchIdx + 1) % len(m.searchMatches)
+					m.textarea = navigateTo(m.textarea, m.searchMatches[m.searchMatchIdx])
+				}
+				m.resetPending()
+				return m, nil
+
+			case "N":
+				if len(m.searchMatches) > 0 {
+					m.searchMatchIdx = (m.searchMatchIdx - 1 + len(m.searchMatches)) % len(m.searchMatches)
+					m.textarea = navigateTo(m.textarea, m.searchMatches[m.searchMatchIdx])
+				}
+				m.resetPending()
+				return m, nil
+
 			default:
 				m.resetPending()
 				return m, nil
@@ -1210,7 +1499,13 @@ func (m Model) View() string {
 	case ModeInsert:
 		statusLine = styles.ModeInsert.Render("-- INSERT --")
 	case ModeNormal:
-		statusLine = styles.ModeNormal.Render("-- NORMAL --")
+		if m.searching {
+			statusLine = styles.ModeNormal.Render("/ " + m.searchQuery)
+		} else if m.searchQuery != "" && len(m.searchMatches) > 0 {
+			statusLine = styles.ModeNormal.Render(fmt.Sprintf("/ %s (%d/%d)", m.searchQuery, m.searchMatchIdx+1, len(m.searchMatches)))
+		} else {
+			statusLine = styles.ModeNormal.Render("-- NORMAL --")
+		}
 	default:
 		statusLine = styles.ModeNormal.Render("-- PREVIEW --")
 	}

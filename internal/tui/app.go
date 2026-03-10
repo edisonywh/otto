@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,6 +46,7 @@ type AppModel struct {
 	width       int
 	height      int
 	ready       bool
+	showHelp    bool
 	err         error
 }
 
@@ -139,6 +141,17 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Help overlay: highest priority key handling.
+		if msg.String() == "?" {
+			m.showHelp = !m.showHelp
+			return m, nil
+		}
+		if m.showHelp {
+			if msg.String() == "q" || msg.String() == "esc" {
+				m.showHelp = false
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Sequence(saveNoteCmd(m.storage, m.activeNote), tea.Quit)
@@ -221,9 +234,6 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.navMode == AppNavModePane {
 				m.navMode = AppNavModeActive
 				m.setFocus(m.focus)
-				if m.focus == FocusEditor {
-					m.editor.EnterInsert()
-				}
 				return m, nil
 			}
 			if m.focus == FocusTodoPane && !m.todoPane.IsEditing() {
@@ -391,6 +401,89 @@ func (m AppModel) View() string {
 		return "Error: " + m.err.Error()
 	}
 
+	if m.showHelp {
+		return lipgloss.Place(m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			helpOverlayView())
+	}
+
 	right := lipgloss.JoinVertical(lipgloss.Left, m.todoPane.View(), m.editor.View())
 	return lipgloss.JoinHorizontal(lipgloss.Top, m.fileBrowser.View(), right)
+}
+
+func helpOverlayView() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69")).Render("Keybindings") +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  (? / q / esc to close)")
+
+	sectionHeader := func(s string) string {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render(s)
+	}
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	entry := func(keys, desc string) string {
+		k := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Width(22).Render(keys)
+		return k + dim.Render(desc)
+	}
+
+	left := strings.Join([]string{
+		sectionHeader("Editor Normal"),
+		entry("i / a / I / A", "Enter insert"),
+		entry("o / O", "Open line above/below"),
+		entry("h / j / k / l", "Navigate"),
+		entry("w / b / e", "Word motions"),
+		entry("0 / $", "Line start/end"),
+		entry("gg / G", "Top/bottom of file"),
+		entry("d / y / c + motion", "Delete/yank/change"),
+		entry("dd / yy / cc", "Line operations"),
+		entry("diw / ciw / yiw", "Inner word"),
+		entry("f / F <char>", "Find char forward/back"),
+		entry("; / ,", "Repeat find / reverse"),
+		entry("r <char>", "Replace char"),
+		entry("x / s", "Delete char / substitute"),
+		entry("p / P", "Paste below/above"),
+		entry("u / ctrl+r", "Undo / redo"),
+		entry("/ <query>", "Search"),
+		entry("n / N", "Next/prev match"),
+		entry("ctrl+p", "Toggle preview"),
+		"",
+		sectionHeader("Editor Insert"),
+		entry("esc", "Back to Normal mode"),
+		entry("ctrl+p", "Toggle preview"),
+	}, "\n")
+
+	right := strings.Join([]string{
+		sectionHeader("Preview"),
+		entry("j / k", "Scroll line"),
+		entry("ctrl+d / ctrl+u", "Half page down/up"),
+		entry("g / G", "Top / bottom"),
+		entry("ctrl+p", "Exit preview"),
+		"",
+		sectionHeader("Todo Pane"),
+		entry("j / k", "Navigate"),
+		entry("g / G", "Top / bottom"),
+		entry("enter", "Toggle done"),
+		entry("i", "Edit text inline"),
+		entry("1 – 4", "Set priority"),
+		entry("/", "Search/filter"),
+		"",
+		sectionHeader("File Browser"),
+		entry("j / k", "Navigate"),
+		entry("enter", "Open note"),
+		"",
+		sectionHeader("App"),
+		entry("tab / shift+tab", "Cycle panes"),
+		entry("ctrl+s", "Save note"),
+		entry("ctrl+c", "Quit"),
+		entry("?", "Toggle this help"),
+		entry("esc", "Enter pane-nav mode"),
+	}, "\n")
+
+	leftCol := lipgloss.NewStyle().Width(46).Render(left)
+	rightCol := lipgloss.NewStyle().Width(40).Render(right)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, rightCol)
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("69")).
+		Padding(1, 2).
+		Render(title + "\n\n" + body)
 }

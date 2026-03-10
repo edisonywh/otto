@@ -86,8 +86,8 @@ func (m *Model) SetSize(w, h int) {
 	m.width = w
 	m.height = h
 	innerW := w - 4
-	// Reserve 2 rows for the search bar inside the border.
-	innerH := h - 6
+	// title(1) + viewport(h-5) + moreIndicator(1) + searchBar(1) = h-2 (border inner).
+	innerH := h - 5
 	if innerW < 1 {
 		innerW = 1
 	}
@@ -121,6 +121,13 @@ func (m *Model) SetActive(active bool) {
 		_ = m.searchInput.Focus()
 	}
 	// Otherwise navigation mode: no input focused, j/k works immediately.
+
+	// Auto-scroll viewport to show the selected item.
+	if m.selectedIdx >= m.viewport.YOffset+m.viewport.Height {
+		m.viewport.YOffset = m.selectedIdx - m.viewport.Height + 1
+	} else if m.selectedIdx < m.viewport.YOffset {
+		m.viewport.YOffset = m.selectedIdx
+	}
 }
 
 // SetHovered sets the hovered state (pane navigation cursor).
@@ -312,10 +319,18 @@ func (m Model) View() string {
 		content = m.viewport.View()
 	}
 
+	var moreIndicator string
+	visibleEnd := m.viewport.YOffset + m.viewport.Height
+	if len(m.filteredTodos) > 0 && visibleEnd < len(m.filteredTodos) {
+		hidden := len(m.filteredTodos) - visibleEnd
+		moreIndicator = styles.Dim.Render(fmt.Sprintf("  ▼ %d more", hidden))
+	}
+
 	searchBar := styles.Dim.Render("/ ") + m.searchInput.View()
 	inner := lipgloss.JoinVertical(lipgloss.Left,
 		title,
 		content,
+		moreIndicator,
 		searchBar,
 	)
 	return border.Width(m.width - 2).Height(m.height - 2).Render(inner)
