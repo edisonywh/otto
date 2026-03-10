@@ -1,0 +1,13 @@
+# Compiled binary
+main
+otto
+
+# Test binaries
+*.test
+
+# macOS
+.DS_Store
+
+# Go workspace
+go.work
+go.work.sum
