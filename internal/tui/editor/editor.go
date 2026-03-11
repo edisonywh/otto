@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/glamour"
@@ -21,9 +22,10 @@ import (
 type VimMode int
 
 const (
-	ModeInsert  VimMode = iota // Editable textarea
-	ModeNormal                 // Vim navigation; textarea still visible + focused (cursor shown)
-	ModePreview                // Glamour read-only viewport (toggle with Ctrl+P)
+	ModeInsert     VimMode = iota // Editable textarea
+	ModeNormal                    // Vim navigation; textarea still visible + focused (cursor shown)
+	ModePreview                   // Glamour read-only viewport (toggle with Ctrl+P)
+	ModeVisualLine                // Visual line selection (V)
 )
 
 const maxUndoStack = 100
@@ -51,6 +53,9 @@ type Model struct {
 	insertStartContent string
 	insertStartLine    int
 	insertStartCol     int
+
+	// Visual line mode anchor
+	visualAnchor int // line where V was pressed
 
 	// Pending operator / multi-key sequences
 	pendingOp      byte // 'd', 'y', 'c', '>', '<', or 0
@@ -91,7 +96,8 @@ func New() Model {
 	return Model{
 		textarea: ta,
 		viewport: viewport.New(0, 0),
-		mode:     ModeNormal,
+		mode:     ModePreview,
+		prevMode: ModePreview,
 	}
 }
 
@@ -123,17 +129,14 @@ func (m *Model) SetSize(w, h int) {
 func (m *Model) SetActive(active bool) {
 	m.active = active
 	if active {
-		if m.mode == ModePreview {
-			m.mode = ModeNormal
-		}
+		// Always enter Normal mode when the editor gains focus.
+		m.mode = ModeNormal
 		m.textarea.Focus()
 	} else {
+		// Always show the rendered preview when the editor loses focus.
 		m.textarea.Blur()
-		if m.mode != ModePreview {
-			m.updateViewport()
-			m.prevMode = m.mode
-			m.mode = ModePreview
-		}
+		m.updateViewport()
+		m.mode = ModePreview
 	}
 }
 
@@ -309,16 +312,21 @@ func curPos(ta textarea.Model) vim.Position {
 
 func moveCursorToLine(ta textarea.Model, targetLine int) textarea.Model {
 	for ta.Line() < targetLine {
-		prev := ta.Line()
+		prevLine := ta.Line()
+		prevRow := ta.LineInfo().RowOffset
 		ta, _ = ta.Update(tea.KeyMsg{Type: tea.KeyDown})
-		if ta.Line() == prev {
+		// Break only when truly stuck (line AND visual row both unchanged).
+		// When traversing a wrapped logical line, ta.Line() stays the same but
+		// RowOffset advances — that is not "stuck".
+		if ta.Line() == prevLine && ta.LineInfo().RowOffset == prevRow {
 			break
 		}
 	}
 	for ta.Line() > targetLine {
-		prev := ta.Line()
+		prevLine := ta.Line()
+		prevRow := ta.LineInfo().RowOffset
 		ta, _ = ta.Update(tea.KeyMsg{Type: tea.KeyUp})
-		if ta.Line() == prev {
+		if ta.Line() == prevLine && ta.LineInfo().RowOffset == prevRow {
 			break
 		}
 	}
@@ -352,13 +360,13 @@ func (m *Model) applyOpForward(targetPos vim.Position, inclusive bool) {
 	}
 	switch m.pendingOp {
 	case 'd':
-		m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+		m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 		m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 		m.textarea = navigateTo(m.textarea, cp)
 	case 'y':
-		m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+		m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 	case 'c':
-		m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+		m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 		m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 		m.textarea = navigateTo(m.textarea, cp)
 		m.enterInsert()
@@ -373,13 +381,13 @@ func (m *Model) applyOpBackward(targetPos vim.Position) {
 	to := vim.ToOffset(lines, cp)
 	switch m.pendingOp {
 	case 'd':
-		m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+		m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 		m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 		m.textarea = navigateTo(m.textarea, targetPos)
 	case 'y':
-		m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+		m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 	case 'c':
-		m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+		m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 		m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 		m.textarea = navigateTo(m.textarea, targetPos)
 		m.enterInsert()
@@ -394,16 +402,24 @@ func (m *Model) deleteLines(from, to int) {
 	}
 	from = clampInt(from, 0, len(lines)-1)
 	to = clampInt(to, 0, len(lines)-1)
-	m.yankBuffer = strings.Join(lines[from:to+1], "\n")
+	m.setYank(strings.Join(lines[from:to+1], "\n"))
 	newLines := make([]string, 0, len(lines)-(to-from+1))
 	newLines = append(newLines, lines[:from]...)
 	newLines = append(newLines, lines[to+1:]...)
 	if len(newLines) == 0 {
 		newLines = []string{""}
 	}
-	m.textarea.SetValue(strings.Join(newLines, "\n"))
 	targetLine := clampInt(from, 0, len(newLines)-1)
-	m.textarea = moveCursorToLine(m.textarea, targetLine)
+	m.textarea.SetValue(strings.Join(newLines, "\n"))
+	// SetValue always resets cursor to line 0 (via Reset). Navigate to targetLine,
+	// but first overshoot by half the viewport height so the cursor ends up near
+	// the middle of the visible area rather than stuck at the bottom.
+	h := m.textarea.Height()
+	overshoot := clampInt(targetLine+h/2, 0, len(newLines)-1)
+	m.textarea = moveCursorToLine(m.textarea, overshoot)
+	if overshoot != targetLine {
+		m.textarea = moveCursorToLine(m.textarea, targetLine)
+	}
 }
 
 func (m *Model) indentCurrentLine(delta int) {
@@ -438,6 +454,12 @@ func clampInt(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+// setYank sets the yank buffer and also writes to the system clipboard.
+func (m *Model) setYank(text string) {
+	m.yankBuffer = text
+	_ = clipboard.WriteAll(text)
 }
 
 // ── Find-char helpers ─────────────────────────────────────────────────────────
@@ -558,7 +580,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	if m.mode == ModePreview {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			switch keyMsg.String() {
-			case "ctrl+p":
+			case "ctrl+p", "esc":
 				m.mode = m.prevMode
 				if m.active {
 					m.textarea.Focus()
@@ -588,6 +610,55 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
+	}
+
+	// ── Visual Line mode ──────────────────────────────────────────────────────
+	if m.mode == ModeVisualLine {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			curLine := m.textarea.Line()
+			from, to := m.visualAnchor, curLine
+			if from > to {
+				from, to = to, from
+			}
+
+			switch keyMsg.String() {
+			case "esc", "V":
+				m.mode = ModeNormal
+				return m, nil
+			case "j", "down":
+				lines := vim.Lines(m.textarea.Value())
+				if m.textarea.Line() < len(lines)-1 {
+					m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyDown})
+				}
+				return m, nil
+			case "k", "up":
+				if m.textarea.Line() > 0 {
+					m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyUp})
+				}
+				return m, nil
+			case "y":
+				lines := vim.Lines(m.textarea.Value())
+				m.setYank(strings.Join(lines[from:to+1], "\n"))
+				m.mode = ModeNormal
+				return m, nil
+			case "d", "x":
+				m.pushUndo()
+				m.deleteLines(from, to)
+				m.mode = ModeNormal
+				return m, nil
+			case "c":
+				m.pushUndo()
+				m.deleteLines(from, to)
+				m.enterInsert()
+				return m, nil
+			case "ctrl+p":
+				m.updateViewport()
+				m.prevMode = ModeNormal
+				m.mode = ModePreview
+				return m, nil
+			}
+		}
+		return m, nil
 	}
 
 	// ── Normal mode ───────────────────────────────────────────────────────────
@@ -692,7 +763,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				return m, nil
 
 			case "a":
-				m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyRight})
+				// Move one right within the current line (don't cross to next line).
+				lines := vim.Lines(m.textarea.Value())
+				line := m.textarea.Line()
+				col := m.textarea.LineInfo().CharOffset
+				if line < len(lines) && col < len([]rune(lines[line])) {
+					m.textarea = navigateTo(m.textarea, vim.Position{Line: line, Col: col + 1})
+				}
 				m.enterInsert()
 				return m, nil
 
@@ -702,7 +779,17 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				return m, nil
 
 			case "A":
-				m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyEnd})
+				// KeyEnd overshoots to the next line when already at the last char.
+				// Navigate explicitly to the last char, then move one right (append pos).
+				lines := vim.Lines(m.textarea.Value())
+				line := m.textarea.Line()
+				if line < len(lines) {
+					lineRunes := []rune(lines[line])
+					if len(lineRunes) > 0 {
+						m.textarea = navigateTo(m.textarea, vim.Position{Line: line, Col: len(lineRunes) - 1})
+					}
+				}
+				m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyRight})
 				m.enterInsert()
 				return m, nil
 
@@ -717,7 +804,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				newLines = append(newLines, "")
 				newLines = append(newLines, lines[line+1:]...)
 				m.textarea.SetValue(strings.Join(newLines, "\n"))
-				m.textarea = moveCursorToLine(m.textarea, line+1)
+				m.textarea = navigateTo(m.textarea, vim.Position{Line: line + 1, Col: 0})
 				m.enterInsert()
 				return m, nil
 
@@ -731,7 +818,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				newLines = append(newLines, "")
 				newLines = append(newLines, lines[line:]...)
 				m.textarea.SetValue(strings.Join(newLines, "\n"))
-				m.textarea = moveCursorToLine(m.textarea, line)
+				m.textarea = navigateTo(m.textarea, vim.Position{Line: line, Col: 0})
 				m.enterInsert()
 				return m, nil
 
@@ -747,7 +834,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 						m.pushUndo()
 						m.deleteLines(startLine, endLine)
 					case 'y':
-						m.yankBuffer = strings.Join(lines[startLine:endLine+1], "\n")
+						m.setYank(strings.Join(lines[startLine:endLine+1], "\n"))
 					case 'c':
 						m.pushUndo()
 						m.deleteLines(startLine, endLine)
@@ -775,7 +862,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 						m.pushUndo()
 						m.deleteLines(endLine, startLine)
 					case 'y':
-						m.yankBuffer = strings.Join(lines[endLine:startLine+1], "\n")
+						m.setYank(strings.Join(lines[endLine:startLine+1], "\n"))
 					case 'c':
 						m.pushUndo()
 						m.deleteLines(endLine, startLine)
@@ -819,14 +906,14 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					switch m.pendingOp {
 					case 'd':
 						m.pushUndo()
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 						m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 						m.textarea = navigateTo(m.textarea, lineStart)
 					case 'y':
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 					case 'c':
 						m.pushUndo()
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 						m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 						m.textarea = navigateTo(m.textarea, lineStart)
 						m.enterInsert()
@@ -848,14 +935,14 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					switch m.pendingOp {
 					case 'd':
 						m.pushUndo()
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, lineEndOff)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, lineEndOff))
 						m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, lineEndOff))
 						m.textarea = navigateTo(m.textarea, cp)
 					case 'y':
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, lineEndOff)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, lineEndOff))
 					case 'c':
 						m.pushUndo()
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, lineEndOff)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, lineEndOff))
 						m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, lineEndOff))
 						m.textarea = navigateTo(m.textarea, cp)
 						m.enterInsert()
@@ -913,7 +1000,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 							m.pushUndo()
 							m.deleteLines(from, to)
 						case 'y':
-							m.yankBuffer = strings.Join(lines[from:to+1], "\n")
+							m.setYank(strings.Join(lines[from:to+1], "\n"))
 						case 'c':
 							m.pushUndo()
 							m.deleteLines(from, to)
@@ -947,7 +1034,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 						m.pushUndo()
 						m.deleteLines(startLine, targetLine)
 					case 'y':
-						m.yankBuffer = strings.Join(lines[startLine:targetLine+1], "\n")
+						m.setYank(strings.Join(lines[startLine:targetLine+1], "\n"))
 					case 'c':
 						m.pushUndo()
 						m.deleteLines(startLine, targetLine)
@@ -957,6 +1044,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					}
 				} else {
 					m.textarea = moveCursorToLine(m.textarea, targetLine)
+					m.textarea, _ = m.textarea.Update(tea.KeyMsg{Type: tea.KeyHome})
 				}
 				m.resetPending()
 				return m, nil
@@ -969,7 +1057,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					from, to := innerWordRange(m.textarea.Value(), lines, curPos(m.textarea))
 					if from < to {
 						m.pushUndo()
-						m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, to)
+						m.setYank(vim.ExtractRange(m.textarea.Value(), from, to))
 						if m.pendingOp == 'd' || m.pendingOp == 'c' {
 							m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, to))
 							newLines := vim.Lines(m.textarea.Value())
@@ -1128,7 +1216,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					}
 					if col < len(lr) {
 						m.pushUndo()
-						m.yankBuffer = string(lr[col:end])
+						m.setYank(string(lr[col:end]))
 						newLine := string(lr[:col]) + string(lr[end:])
 						lines[line] = newLine
 						m.textarea.SetValue(strings.Join(lines, "\n"))
@@ -1160,7 +1248,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					}
 					if col < len(lr) {
 						m.pushUndo()
-						m.yankBuffer = string(lr[col:end])
+						m.setYank(string(lr[col:end]))
 						lines[line] = string(lr[:col]) + string(lr[end:])
 						m.textarea.SetValue(strings.Join(lines, "\n"))
 						m.textarea = navigateTo(m.textarea, vim.Position{Line: line, Col: col})
@@ -1239,7 +1327,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				from := vim.ToOffset(lines, cp)
 				if from < lineEndOff {
 					m.pushUndo()
-					m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, lineEndOff)
+					m.setYank(vim.ExtractRange(m.textarea.Value(), from, lineEndOff))
 					m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, lineEndOff))
 					m.textarea = navigateTo(m.textarea, cp)
 				}
@@ -1254,7 +1342,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				from := vim.ToOffset(lines, cp)
 				if from < lineEndOff {
 					m.pushUndo()
-					m.yankBuffer = vim.ExtractRange(m.textarea.Value(), from, lineEndOff)
+					m.setYank(vim.ExtractRange(m.textarea.Value(), from, lineEndOff))
 					m.textarea.SetValue(vim.DeleteRange(m.textarea.Value(), from, lineEndOff))
 					m.textarea = navigateTo(m.textarea, cp)
 				}
@@ -1268,7 +1356,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				line := m.textarea.Line()
 				if line < len(lines) {
 					m.pushUndo()
-					m.yankBuffer = lines[line]
+					m.setYank(lines[line])
 					lines[line] = ""
 					m.textarea.SetValue(strings.Join(lines, "\n"))
 					m.textarea = moveCursorToLine(m.textarea, line)
@@ -1300,7 +1388,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					lines := vim.Lines(content)
 					line := m.textarea.Line()
 					endLine := clampInt(line+count-1, 0, len(lines)-1)
-					m.yankBuffer = strings.Join(lines[line:endLine+1], "\n")
+					m.setYank(strings.Join(lines[line:endLine+1], "\n"))
 					m.pendingOp = 0
 				} else {
 					m.pendingG = false
@@ -1317,7 +1405,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					line := m.textarea.Line()
 					endLine := clampInt(line+count-1, 0, len(lines)-1)
 					m.pushUndo()
-					m.yankBuffer = strings.Join(lines[line:endLine+1], "\n")
+					m.setYank(strings.Join(lines[line:endLine+1], "\n"))
 					// Replace range with a single blank line at `line`
 					newLines := make([]string, 0)
 					newLines = append(newLines, lines[:line]...)
@@ -1449,6 +1537,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				m.resetPending()
 				return m, nil
 
+			// ── V: visual line mode ────────────────────────────────────────
+			case "V":
+				m.visualAnchor = m.textarea.Line()
+				m.mode = ModeVisualLine
+				m.resetPending()
+				return m, nil
+
 			default:
 				m.resetPending()
 				return m, nil
@@ -1464,6 +1559,24 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.updateViewport()
 			m.prevMode = ModeInsert
 			m.mode = ModePreview
+			return m, nil
+		case "tab":
+			// tea.KeyTab has empty Runes so the textarea default handler inserts
+			// nothing. Insert the tab character explicitly.
+			content := m.textarea.Value()
+			lines := vim.Lines(content)
+			line := m.textarea.Line()
+			col := m.textarea.LineInfo().CharOffset
+			if line < len(lines) {
+				lr := []rune(lines[line])
+				newLr := make([]rune, 0, len(lr)+1)
+				newLr = append(newLr, lr[:col]...)
+				newLr = append(newLr, '\t')
+				newLr = append(newLr, lr[col:]...)
+				lines[line] = string(newLr)
+				m.textarea.SetValue(strings.Join(lines, "\n"))
+				m.textarea = navigateTo(m.textarea, vim.Position{Line: line, Col: col + 1})
+			}
 			return m, nil
 		}
 		if keyMsg.Type == tea.KeyEsc {
@@ -1488,9 +1601,12 @@ func (m Model) View() string {
 	}
 
 	var content string
-	if m.mode == ModePreview {
+	switch m.mode {
+	case ModePreview:
 		content = m.viewport.View()
-	} else {
+	case ModeVisualLine:
+		content = m.renderVisualLines()
+	default:
 		content = m.textarea.View()
 	}
 
@@ -1506,6 +1622,13 @@ func (m Model) View() string {
 		} else {
 			statusLine = styles.ModeNormal.Render("-- NORMAL --")
 		}
+	case ModeVisualLine:
+		curLine := m.textarea.Line()
+		from, to := m.visualAnchor, curLine
+		if from > to {
+			from, to = to, from
+		}
+		statusLine = styles.ModeNormal.Render(fmt.Sprintf("-- VISUAL LINE -- (%d lines)", to-from+1))
 	default:
 		statusLine = styles.ModeNormal.Render("-- PREVIEW --")
 	}
@@ -1515,4 +1638,60 @@ func (m Model) View() string {
 
 	inner := title + "\n" + content + "\n" + statusLine
 	return border.Width(m.width - 2).Height(m.height - 2).Render(inner)
+}
+
+// renderVisualLines renders the editor content with selected lines highlighted.
+func (m Model) renderVisualLines() string {
+	lines := vim.Lines(m.textarea.Value())
+	h := m.textarea.Height()
+	cursorLine := m.textarea.Line()
+
+	// Approximate viewport offset (mirrors bubbles textarea scroll behaviour).
+	yOffset := 0
+	if cursorLine >= h {
+		yOffset = cursorLine - h + 1
+	}
+	end := yOffset + h
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	from, to := m.visualAnchor, cursorLine
+	if from > to {
+		from, to = to, from
+	}
+
+	numWidth := len(strconv.Itoa(len(lines)))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	selStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color("62")).
+		Foreground(lipgloss.Color("255"))
+	contentWidth := m.viewport.Width - numWidth - 4 // " N │ "
+
+	var sb strings.Builder
+	for i := yOffset; i < end; i++ {
+		lineNum := fmt.Sprintf("%*d", numWidth, i+1)
+		lineContent := lines[i]
+		if contentWidth > 0 && len([]rune(lineContent)) > contentWidth {
+			lineContent = string([]rune(lineContent)[:contentWidth])
+		}
+		row := lineNum + " │ " + lineContent
+		if i >= from && i <= to {
+			// Pad to full width so the background fills the line.
+			w := m.viewport.Width - 2
+			sb.WriteString(selStyle.Width(w).Render(row))
+		} else {
+			sb.WriteString(dimStyle.Render(lineNum) + " │ " + lineContent)
+		}
+		if i < end-1 {
+			sb.WriteString("\n")
+		}
+	}
+	// Pad with blank lines to fill textarea height.
+	rendered := sb.String()
+	linesRendered := end - yOffset
+	for i := linesRendered; i < h; i++ {
+		rendered += "\n"
+	}
+	return rendered
 }

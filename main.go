@@ -18,7 +18,7 @@ func main() {
 	}
 
 	m := tui.New(s)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "otto: %v\n", err)
 		os.Exit(1)

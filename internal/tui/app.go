@@ -142,7 +142,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		// Help overlay: highest priority key handling.
-		if msg.String() == "?" {
+		// Don't intercept '?' when the editor is in Insert mode (it's literal text input).
+		editorInInsert := m.focus == FocusEditor && m.editor.Mode() == editor.ModeInsert
+		if msg.String() == "?" && !editorInInsert {
 			m.showHelp = !m.showHelp
 			return m, nil
 		}
@@ -163,11 +165,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			if m.focus == FocusEditor {
-				if m.editor.Mode() == editor.ModeInsert {
-					// Fall through: editor handles Esc → Normal mode
+				if m.editor.Mode() == editor.ModeInsert || m.editor.Mode() == editor.ModeVisualLine || m.editor.Mode() == editor.ModePreview {
+					// Fall through: editor handles Esc
 					break
 				}
-				// Normal or Preview → NavPane
+				// Normal → NavPane
 				m.navMode = AppNavModePane
 				m.setFocus(m.focus)
 				return m, nil
@@ -181,17 +183,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				wasEditor := m.focus == FocusEditor
 				switch msg.String() {
 				case "h":
-					m.setFocus(FocusFileBrowser)
+					if m.focus == FocusEditor {
+						m.setFocus(FocusTodoPane)
+					}
 				case "l":
-					if m.focus == FocusFileBrowser {
+					if m.focus == FocusTodoPane || m.focus == FocusFileBrowser {
 						m.setFocus(FocusEditor)
 					}
 				case "j":
-					if m.focus == FocusFileBrowser || m.focus == FocusTodoPane {
-						m.setFocus(FocusEditor)
+					if m.focus == FocusTodoPane {
+						m.setFocus(FocusFileBrowser)
 					}
 				case "k":
-					if m.focus == FocusEditor {
+					if m.focus == FocusFileBrowser {
 						m.setFocus(FocusTodoPane)
 					}
 				}
@@ -384,12 +388,12 @@ func (m *AppModel) setFocus(f FocusTarget) {
 func (m *AppModel) distributeSize() {
 	leftW := m.width * 27 / 100
 	rightW := m.width - leftW
-	topH := m.height * 25 / 100
+	topH := m.height * 40 / 100
 	bottomH := m.height - topH
 
-	m.fileBrowser.SetSize(leftW, m.height)
-	m.todoPane.SetSize(rightW, topH)
-	m.editor.SetSize(rightW, bottomH)
+	m.todoPane.SetSize(leftW, topH)
+	m.fileBrowser.SetSize(leftW, bottomH)
+	m.editor.SetSize(rightW, m.height)
 }
 
 // View renders the full layout.
@@ -407,8 +411,8 @@ func (m AppModel) View() string {
 			helpOverlayView())
 	}
 
-	right := lipgloss.JoinVertical(lipgloss.Left, m.todoPane.View(), m.editor.View())
-	return lipgloss.JoinHorizontal(lipgloss.Top, m.fileBrowser.View(), right)
+	left := lipgloss.JoinVertical(lipgloss.Left, m.todoPane.View(), m.fileBrowser.View())
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, m.editor.View())
 }
 
 func helpOverlayView() string {
@@ -432,6 +436,8 @@ func helpOverlayView() string {
 		entry("w / b / e", "Word motions"),
 		entry("0 / $", "Line start/end"),
 		entry("gg / G", "Top/bottom of file"),
+		entry("V", "Visual line mode"),
+		entry("y / d / c (visual)", "Yank / delete / change lines"),
 		entry("d / y / c + motion", "Delete/yank/change"),
 		entry("dd / yy / cc", "Line operations"),
 		entry("diw / ciw / yiw", "Inner word"),
