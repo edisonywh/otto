@@ -155,7 +155,19 @@ func (m Model) renderContent() string {
 	}
 
 	var sb strings.Builder
+	overdueHeaderWritten := false
+	lastWasOverdue := false
+
 	for i, t := range m.filteredTodos {
+		if t.IsOverdue() && !overdueHeaderWritten {
+			overdueHeaderWritten = true
+			sb.WriteString("  " + styles.SectionHeader.Render("Overdue (!)") + "\n")
+		}
+		if overdueHeaderWritten && lastWasOverdue && !t.IsOverdue() {
+			sb.WriteString("  " + styles.Dim.Render("──────────────") + "\n")
+		}
+		lastWasOverdue = t.IsOverdue()
+
 		var line string
 		if i == m.selectedIdx && m.editing {
 			line = "  " + m.editInput.View()
@@ -178,9 +190,15 @@ func formatTodo(t models.Todo) string {
 
 	switch {
 	case t.IsOverdue():
-		prefix := styles.TodoOverdue.Render("[!]")
-		text := styles.TodoOverdue.Render(fmt.Sprintf(" %s  %s", dateStr, t.Text))
-		return prefix + text
+		if t.Priority > 0 {
+			s := styles.PriorityStyle(t.Priority)
+			prefix := s.Render("[!]")
+			text := s.Render(fmt.Sprintf(" %s  %s", dateStr, t.Text))
+			return prefix + text
+		}
+		prefix := "[!]"
+		text := fmt.Sprintf(" %s  %s", dateStr, t.Text)
+		return prefix + styles.TodoPending.Render(text)
 	case t.Done:
 		line := fmt.Sprintf("[x] %s  %s", dateStr, t.Text)
 		return styles.TodoDone.Render(line)

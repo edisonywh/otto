@@ -101,6 +101,18 @@ func loadAllNotesCmd(s storage.Storage) tea.Cmd {
 	}
 }
 
+// loadTodayNoteCmd loads (or creates) today's note from storage.
+func loadTodayNoteCmd(s storage.Storage) tea.Cmd {
+	return func() tea.Msg {
+		today := time.Now().Truncate(24 * time.Hour)
+		note, err := s.LoadNote(today)
+		if err != nil {
+			return ErrMsg{Err: err}
+		}
+		return TodayNoteLoadedMsg{Note: note}
+	}
+}
+
 // clearSavedCmd fires after a short delay to hide the "Saved" indicator.
 func clearSavedCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
@@ -225,6 +237,21 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// NavPane or other panes: fall through to updateFocused
+		case "T":
+			if m.focus == FocusFileBrowser && m.navMode == AppNavModeActive {
+				today := time.Now().Truncate(24 * time.Hour)
+				for _, note := range m.notes {
+					if note.Day.Equal(today) {
+						m.fileBrowser.SelectDate(note.DateKey())
+						if m.activeNote == nil || !note.Day.Equal(m.activeNote.Day) {
+							m.activeNote = note
+							m.editor.SetNote(note)
+						}
+						return m, nil
+					}
+				}
+				return m, loadTodayNoteCmd(m.storage)
+			}
 		case "tab":
 			if m.focus == FocusEditor && m.editor.Mode() == editor.ModeInsert {
 				break // let textarea handle tab (insert character)
@@ -311,6 +338,25 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case TodayNoteLoadedMsg:
+		today := msg.Note.Day
+		found := false
+		for i, n := range m.notes {
+			if n.Day.Equal(today) {
+				m.notes[i] = msg.Note
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.notes = append([]*models.Note{msg.Note}, m.notes...)
+		}
+		m.fileBrowser.SetNotes(m.notes)
+		m.fileBrowser.SelectDate(msg.Note.DateKey())
+		m.activeNote = msg.Note
+		m.editor.SetNote(msg.Note)
+		return m, refreshTodosCmd(m.notes)
+
 	case ErrMsg:
 		m.err = msg.Err
 		return m, nil
@@ -350,6 +396,12 @@ func (m AppModel) updateFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case FocusFileBrowser:
 		m.fileBrowser, cmd = m.fileBrowser.Update(msg)
+		if sel := m.fileBrowser.SelectedNote(); sel != nil {
+			if m.activeNote == nil || !sel.Day.Equal(m.activeNote.Day) {
+				m.activeNote = sel
+				m.editor.SetNote(sel)
+			}
+		}
 	}
 
 	return m, cmd
@@ -474,6 +526,7 @@ func helpOverlayView() string {
 		sectionHeader("File Browser"),
 		entry("j / k", "Navigate"),
 		entry("enter", "Open note"),
+		entry("T", "Jump to / open today"),
 		"",
 		sectionHeader("App"),
 		entry("tab / shift+tab", "Cycle panes"),

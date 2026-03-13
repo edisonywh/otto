@@ -170,7 +170,20 @@ func CollectAllTodos(notes []*models.Note) []models.Todo {
 			return todos[i].Day.After(todos[j].Day)
 		})
 	}
-	sortByDay(overdue)
+	// Overdue: highest priority first (1 beats 2 beats … beats 0/no-priority), then newer date.
+	sort.SliceStable(overdue, func(i, j int) bool {
+		pi, pj := overdue[i].Priority, overdue[j].Priority
+		if pi == 0 {
+			pi = 5
+		}
+		if pj == 0 {
+			pj = 5
+		}
+		if pi != pj {
+			return pi < pj
+		}
+		return overdue[i].Day.After(overdue[j].Day)
+	})
 	for i := 1; i <= 4; i++ {
 		sortByDay(priority[i])
 	}

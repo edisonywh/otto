@@ -2,6 +2,7 @@ package filebrowser
 
 import (
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -18,16 +19,44 @@ type item struct {
 	note *models.Note
 }
 
-func (i item) Title() string {
-	icon := " "
-	if i.note.HasPendingTodos() {
-		icon = styles.PendingIcon()
-	}
-	return fmt.Sprintf("%s %s", icon, i.note.DateKey())
-}
-
+func (i item) Title() string       { return i.note.DateKey() }
 func (i item) Description() string { return "" }
 func (i item) FilterValue() string { return i.note.DateKey() }
+
+type itemDelegate struct{}
+
+func (d itemDelegate) Height() int                             { return 1 }
+func (d itemDelegate) Spacing() int                            { return 0 }
+func (d itemDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+
+var selectedItemStyle = lipgloss.NewStyle().
+	Border(lipgloss.NormalBorder(), false, false, false, true).
+	BorderForeground(lipgloss.Color("99")).
+	Foreground(lipgloss.Color("207")).
+	PaddingLeft(1)
+
+func (d itemDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	i, ok := listItem.(item)
+	if !ok {
+		return
+	}
+	icon := " "
+	if i.note.HasPendingTodos() {
+		icon = "●"
+	}
+	dateStr := icon + " " + i.note.DateKey()
+	if index == m.Index() {
+		fmt.Fprint(w, selectedItemStyle.Render(dateStr))
+	} else {
+		var styledIcon string
+		if i.note.HasPendingTodos() {
+			styledIcon = styles.PendingIconStyle.Render("●")
+		} else {
+			styledIcon = " "
+		}
+		fmt.Fprint(w, "  "+styledIcon+" "+i.note.DateKey())
+	}
+}
 
 // Model is the file browser pane.
 type Model struct {
@@ -43,12 +72,7 @@ type Model struct {
 
 // New creates a new file browser model.
 func New() Model {
-	delegate := list.NewDefaultDelegate()
-	delegate.ShowDescription = false
-	delegate.SetHeight(1)
-	delegate.SetSpacing(0)
-
-	l := list.New(nil, delegate, 0, 0)
+	l := list.New(nil, itemDelegate{}, 0, 0)
 	l.Title = "Notes"
 	l.SetShowHelp(false)
 	l.SetShowStatusBar(false)
@@ -111,6 +135,16 @@ func (m *Model) SetActive(active bool) {
 // SetHovered sets the hovered state (pane navigation cursor).
 func (m *Model) SetHovered(hovered bool) {
 	m.hovered = hovered
+}
+
+// SelectDate selects the note with the given date key in the list.
+func (m *Model) SelectDate(dateKey string) {
+	for i, n := range m.filtered {
+		if n.DateKey() == dateKey {
+			m.list.Select(i)
+			return
+		}
+	}
 }
 
 // SelectedNote returns the currently highlighted note.

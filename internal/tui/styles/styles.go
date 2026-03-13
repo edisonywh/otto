@@ -70,6 +70,10 @@ var (
 	SavedIndicator = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("82")).
 			Italic(true)
+
+	SectionHeader = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("244")).
+			Italic(true)
 )
 
 // Border returns the appropriate border style based on focus state.

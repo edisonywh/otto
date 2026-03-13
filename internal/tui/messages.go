@@ -29,3 +29,8 @@ type ErrMsg struct {
 
 // ClearSavedMsg is sent after the "Saved" indicator timeout expires.
 type ClearSavedMsg struct{}
+
+// TodayNoteLoadedMsg is sent after today's note has been loaded or created (e.g. via T key).
+type TodayNoteLoadedMsg struct {
+	Note *models.Note
+}
