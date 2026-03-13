@@ -76,12 +76,13 @@ type Model struct {
 	// Count prefix accumulator ("2" in "2j", "12" in "12w")
 	countStr string
 
-	yankBuffer string
-	showSaved  bool
-	active     bool
-	hovered    bool
-	width      int
-	height     int
+	yankBuffer   string
+	showSaved    bool
+	active       bool
+	hovered      bool
+	width        int
+	height       int
+	gutterExtra  int // extra chars subtracted from textarea width to compensate gutter overflow
 }
 
 // New creates a new editor model.
@@ -90,6 +91,7 @@ func New() Model {
 	ta.Placeholder = "Start writing your notes for today...\nUse '[] task' to add a todo."
 	ta.ShowLineNumbers = true
 	ta.CharLimit = 0
+	ta.MaxHeight = 0
 	ta.FocusedStyle.Base = lipgloss.NewStyle()
 	ta.BlurredStyle.Base = lipgloss.NewStyle()
 
@@ -108,7 +110,27 @@ func (m *Model) SetNote(note *models.Note) {
 	if m.active {
 		m.textarea.Focus()
 	}
+	m.syncTextareaWidth()
 	m.updateViewport()
+}
+
+// syncTextareaWidth adjusts ta.SetWidth to compensate for the bubbles textarea
+// gutter-overflow bug: with MaxHeight=0 the gutter renders (2+numDigits) chars
+// but bubbles only reserves 4, so at 100+ lines the gutter eats into text space.
+func (m *Model) syncTextareaWidth() {
+	lineCount := strings.Count(m.textarea.Value(), "\n") + 1
+	numDigits := len(strconv.Itoa(lineCount))
+	// gutter = " %Nd " where N=numDigits(actual) and format adds leading+trailing space
+	// reserved = 4; overflow = max(0, (2+numDigits) - 4) = max(0, numDigits-2)
+	overflow := numDigits - 2
+	if overflow < 0 {
+		overflow = 0
+	}
+	if overflow == m.gutterExtra {
+		return
+	}
+	m.gutterExtra = overflow
+	m.textarea.SetWidth(m.viewport.Width - overflow)
 }
 
 // SetSize sets the editor dimensions.
@@ -119,10 +141,11 @@ func (m *Model) SetSize(w, h int) {
 	if innerH < 1 {
 		innerH = 1
 	}
-	m.textarea.SetWidth(w - 4)
-	m.textarea.SetHeight(innerH)
 	m.viewport.Width = w - 4
 	m.viewport.Height = innerH
+	m.textarea.SetHeight(innerH)
+	m.gutterExtra = -1 // force recalc
+	m.syncTextareaWidth()
 }
 
 // SetActive sets focus state. Textarea stays focused in Normal mode so cursor is visible.
@@ -1586,6 +1609,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	}
 
 	m.textarea, cmd = m.textarea.Update(msg)
+	m.syncTextareaWidth()
 	return m, cmd
 }
 

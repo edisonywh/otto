@@ -38,8 +38,9 @@ type AppModel struct {
 	fileBrowser filebrowser.Model
 	todoPane    todopane.Model
 	editor      editor.Model
-	focus       FocusTarget
-	navMode     AppNavMode
+	focus         FocusTarget
+	previousFocus FocusTarget
+	navMode       AppNavMode
 	notes       []*models.Note
 	activeNote  *models.Note
 	storage     storage.Storage
@@ -181,7 +182,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Fall through: editor handles Esc
 					break
 				}
-				// Normal → NavPane
+				// Normal: back to file browser if that's where we came from, else NavPane
+				if m.previousFocus == FocusFileBrowser {
+					m.navMode = AppNavModeActive
+					m.setFocus(FocusFileBrowser)
+					return m, nil
+				}
 				m.navMode = AppNavModePane
 				m.setFocus(m.focus)
 				return m, nil
@@ -285,13 +291,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.focus == FocusFileBrowser {
-				selected := m.fileBrowser.SelectedNote()
-				if selected != nil && (m.activeNote == nil || !selected.Day.Equal(m.activeNote.Day)) {
-					saveCmd := saveNoteCmd(m.storage, m.activeNote)
-					m.activeNote = selected
-					m.editor.SetNote(selected)
-					return m, tea.Sequence(saveCmd, refreshTodosCmd(m.notes))
-				}
+				m.navMode = AppNavModeActive
+				m.setFocus(FocusEditor)
 				return m, nil
 			}
 		}
@@ -377,6 +378,7 @@ func (m AppModel) updateFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch m.focus {
 	case FocusEditor:
+		wasInsert := m.editor.Mode() == editor.ModeInsert
 		var oldContent string
 		if m.activeNote != nil {
 			oldContent = m.activeNote.Content
@@ -384,10 +386,17 @@ func (m AppModel) updateFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.editor, cmd = m.editor.Update(msg)
 		if m.activeNote != nil {
 			newContent := m.editor.Content()
+			exitedInsert := wasInsert && m.editor.Mode() != editor.ModeInsert
 			if newContent != oldContent {
 				m.activeNote.Content = newContent
 				m.activeNote.Todos = parser.ParseTodos(newContent, m.activeNote.Day)
+				if exitedInsert {
+					return m, tea.Batch(cmd, refreshTodosCmd(m.notes), saveNoteCmd(m.storage, m.activeNote))
+				}
 				return m, tea.Batch(cmd, refreshTodosCmd(m.notes))
+			}
+			if exitedInsert {
+				return m, tea.Batch(cmd, saveNoteCmd(m.storage, m.activeNote))
 			}
 		}
 
@@ -423,6 +432,7 @@ func (m *AppModel) cycleFocus(dir int) tea.Cmd {
 }
 
 func (m *AppModel) setFocus(f FocusTarget) {
+	m.previousFocus = m.focus
 	m.focus = f
 	isActive := m.navMode == AppNavModeActive
 
